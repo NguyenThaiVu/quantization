@@ -32,7 +32,7 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         input_prompt = sys.argv[1]
     else:
-        input_prompt = "What is the capital of Viet Nam?"
+        input_prompt = "What is the capital of VietNam?"
     print(f"Input prompt: {input_prompt}")
 
     # 1. Load model
