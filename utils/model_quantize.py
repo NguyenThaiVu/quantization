@@ -134,32 +134,46 @@ class FeedForward(nn.Module):
         return self.fc3(x)
 
 
-def quantize_matrix_symmetric_int8(mat:torch.Tensor):
+def quantize_matrix_symmetric_int8(mat: torch.Tensor):
     """
     Symmetric quantization to int8.
     mat: input float matrix (e.g., torch.float32 or torch.bfloat16)
     """
     max_val = torch.max(torch.abs(mat))
-    
+
     qmin = -128
     qmax = 127
     scale = max_val / qmax
-    
+
     q_mat = torch.clamp(torch.round(mat / scale), qmin, qmax).to(torch.int8)
-    
+
     scale = scale.clone().detach().to(torch.float32)
     return q_mat, scale
 
-def de_quantize_matrix_symmetric_int8(q_mat:torch.Tensor, scale:torch.Tensor, out_dtype=torch.float16):
+
+def de_quantize_matrix_symmetric_int8(
+    q_mat: torch.Tensor, scale: torch.Tensor, out_dtype=torch.float16
+):
     """
     Dequantize int8 tensor to float.
     q_mat: input int8 tensor
     scale: scale factor (single value)
     """
-    output = q_mat.to(torch.float32) 
+    output = q_mat.to(torch.float32)
     output = output * scale
     output = output.to(out_dtype)
     return output
+
+
+# TODO: Replace with actual int8 matmul implementation
+def dummy_int8_matmul(A_int8: torch.Tensor, B_int: torch.Tensor, out_dtype=torch.int32):
+    """
+    This is a dummy int8 matrix multiplication function.
+    """
+    if A_int8.dtype != torch.int8 or B_int.dtype != torch.int8:
+        raise ValueError("Both A and B must be int8 tensors.")
+    result_float = torch.matmul(A_int8.float(), B_int.float())
+    return result_float.to(out_dtype)
 
 
 class GroupedQueryAttention(nn.Module):
@@ -174,26 +188,53 @@ class GroupedQueryAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = d_out // num_heads
 
-        self.W_key = nn.Parameter(torch.empty((num_kv_groups * self.head_dim, d_in), dtype=dtype))
-        self.W_value = nn.Parameter(torch.empty((num_kv_groups * self.head_dim, d_in), dtype=dtype))  
+        self.W_key = nn.Parameter(
+            torch.empty((num_kv_groups * self.head_dim, d_in), dtype=dtype)
+        )
+        self.W_value = nn.Parameter(
+            torch.empty((num_kv_groups * self.head_dim, d_in), dtype=dtype)
+        )
         self.num_kv_groups = num_kv_groups
         self.group_size = num_heads // num_kv_groups
 
         self.W_query = nn.Parameter(torch.empty((d_out, d_in), dtype=dtype))
         self.out_proj = nn.Parameter(torch.empty((d_out, d_out), dtype=dtype))
-        
+
         # Quantization parameters
-        self.register_buffer('W_query_scale', torch.ones(1, dtype=torch.float32), persistent=False)
-        self.register_buffer('W_key_scale', torch.ones(1, dtype=torch.float32), persistent=False)
-        self.register_buffer('W_value_scale', torch.ones(1, dtype=torch.float32), persistent=False)
-        self.register_buffer('out_proj_scale', torch.ones(1, dtype=torch.float32), persistent=False)
-        
-        self.register_buffer('W_query_q', torch.empty_like(self.W_query, dtype=torch.int8), persistent=False)
-        self.register_buffer('W_key_q', torch.empty_like(self.W_key, dtype=torch.int8), persistent=False)
-        self.register_buffer('W_value_q', torch.empty_like(self.W_value, dtype=torch.int8), persistent=False)
-        self.register_buffer('out_proj_q', torch.empty_like(self.out_proj, dtype=torch.int8), persistent=False)
-        
+        self.register_buffer("W_query_scale", torch.tensor(1.0, dtype=torch.float32), persistent=False)
+        self.register_buffer("W_key_scale", torch.tensor(1.0, dtype=torch.float32), persistent=False)
+        self.register_buffer("W_value_scale", torch.tensor(1.0, dtype=torch.float32), persistent=False)
+        self.register_buffer("out_proj_scale", torch.tensor(1.0, dtype=torch.float32), persistent=False)
+
+        self.register_buffer("W_query_q",torch.empty_like(self.W_query, dtype=torch.int8),persistent=False)
+        self.register_buffer("W_key_q", torch.empty_like(self.W_key, dtype=torch.int8), persistent=False)
+        self.register_buffer("W_value_q", torch.empty_like(self.W_value, dtype=torch.int8),persistent=False)
+        self.register_buffer("out_proj_q", torch.empty_like(self.out_proj, dtype=torch.int8),persistent=False)
+
+        # Calibration flag
+        self.register_buffer("x_min", torch.tensor(0.0, dtype=torch.float32), persistent=False)
+        self.register_buffer("x_max", torch.tensor(0.0, dtype=torch.float32), persistent=False)
+        self.register_buffer("x_scale", torch.tensor(1.0, dtype=torch.float32), persistent=False)
+        self.register_buffer("x_o_min", torch.tensor(0.0, dtype=torch.float32), persistent=False)  # output of scaled dot-product
+        self.register_buffer("x_o_max", torch.tensor(0.0, dtype=torch.float32), persistent=False)  # output of scaled dot-product
+        self.register_buffer("x_o_scale", torch.tensor(1.0, dtype=torch.float32), persistent=False)  # output of scaled dot-product
+        self.calibrating = True
+
         self.is_quantized = False
+
+    @torch.no_grad()
+    def observe_activation(self, x):
+        min_val = x.min()
+        max_val = x.max()
+        self.x_min = min(self.x_min, min_val)
+        self.x_max = max(self.x_max, max_val)
+        
+    @torch.no_grad()
+    def observe_output_activation(self, x_o):
+        min_val_o = x_o.min()
+        max_val_o = x_o.max()
+        self.x_o_min = min(self.x_o_min, min_val_o)
+        self.x_o_max = max(self.x_o_max, max_val_o)
 
     @torch.no_grad()
     def quantize_weights(self):
@@ -201,91 +242,109 @@ class GroupedQueryAttention(nn.Module):
         W_query_q, W_query_scale = quantize_matrix_symmetric_int8(self.W_query)
         self.W_query_q.copy_(W_query_q)
         self.W_query_scale.copy_(W_query_scale)
-        
-        # Compare MSE before deleting original weights
-        W_query_deq = de_quantize_matrix_symmetric_int8(
-            self.W_query_q, self.W_query_scale, out_dtype=self.W_query.dtype
-        )
-        mse_W_query = torch.mean((self.W_query - W_query_deq) ** 2).item()
-        print(f"[INFO] MSE for W_query after quantization-dequantization: {mse_W_query:.6f}")
-        ################################################################################
-        
+
         # Quantize W_key
         W_key_q, W_key_scale = quantize_matrix_symmetric_int8(self.W_key)
         self.W_key_q.copy_(W_key_q)
         self.W_key_scale.copy_(W_key_scale)
-        
-        W_key_deq = de_quantize_matrix_symmetric_int8(
-            self.W_key_q, self.W_key_scale, out_dtype=self.W_key.dtype
-        )
-        mse_W_key = torch.mean((self.W_key - W_key_deq) ** 2).item()
-        print(f"[INFO] MSE for W_key after quantization-dequantization: {mse_W_key:.6f}")
-        ################################################################################
-        
+
         # Quantize W_value
         W_value_q, W_value_scale = quantize_matrix_symmetric_int8(self.W_value)
         self.W_value_q.copy_(W_value_q)
         self.W_value_scale.copy_(W_value_scale)
-        
-        W_value_deq = de_quantize_matrix_symmetric_int8(
-            self.W_value_q, self.W_value_scale, out_dtype=self.W_value.dtype
-        )
-        mse_W_value = torch.mean((self.W_value - W_value_deq) ** 2).item()
-        print(f"[INFO] MSE for W_value after quantization-dequantization: {mse_W_value:.6f}")
-        ################################################################################
-        
+
         # Quantize out_proj
         out_proj_q, out_proj_scale = quantize_matrix_symmetric_int8(self.out_proj)
         self.out_proj_q.copy_(out_proj_q)
         self.out_proj_scale.copy_(out_proj_scale)
-        
-        out_proj_deq = de_quantize_matrix_symmetric_int8(
-            self.out_proj_q, self.out_proj_scale, out_dtype=self.out_proj.dtype
-        )
-        mse_out_proj = torch.mean((self.out_proj - out_proj_deq) ** 2).item()
-        print(f"[INFO] MSE for out_proj after quantization-dequantization: {mse_out_proj:.6f}")
-        ################################################################################
-        
-        # Free up memory 
+
+        # Free up memory
         del self.W_query
         del self.W_key
         del self.W_value
         del self.out_proj
-        
-        self.is_quantized = True
-        print("[INFO] Weights have been quantized to uint8. Deleted original weights to save memory.")
 
+        self.is_quantized = True
+        print("[INFO] Quantized weights to int8. Deleted original weights to save memory.")
+
+        # Compute activation quantization parameters
+        x_max = max(abs(self.x_min), abs(self.x_max))
+        x_scale = x_max / 127.0
+        self.x_scale.copy_(x_scale)
+        print(f"[INFO] Activation quantization scale set to {x_scale.item():.6f}")
+        
+        # Compute output activation quantization parameters
+        x_o_max = max(abs(self.x_o_min), abs(self.x_o_max))
+        x_o_scale = x_o_max / 127.0
+        self.x_o_scale.copy_(x_o_scale)
+        print(f"[INFO] Output activation quantization scale set to {x_o_scale.item():.6f}")
 
     def forward(self, x, mask, cos, sin):
         b, num_tokens, d_in = x.shape
 
-        # Normal float32 weights
-        if (self.is_quantized == False):
+        # 1. Query projection
+        if (self.is_quantized == False) and (self.calibrating == False):
+            queries = x @ self.W_query.T  # Shape: (b, num_tokens, d_out)
+        elif (self.is_quantized == False) and (self.calibrating == True):  # Calibration
+            self.observe_activation(x)
             queries = x @ self.W_query.T  # Shape: (b, num_tokens, d_out)
         else:
-            # Dequantize weights on-the-fly
-            W_query_deq = de_quantize_matrix_symmetric_int8(
-                self.W_query_q, self.W_query_scale, out_dtype=x.dtype
-            )
-            queries = x @ W_query_deq.T  # Shape: (b, num_tokens, d_out)
+            # Quantize input
+            if x.dtype != torch.int8:
+                X_q = torch.clamp(torch.round(x / self.x_scale), -128, 127).to(torch.int8)
+            else:
+                X_q = x
+            queries_quant = dummy_int8_matmul(X_q, self.W_query_q.T, out_dtype=torch.int32)
+            queries = (queries_quant.to(x.dtype) * self.x_scale * self.W_query_scale)  # Shape: (b, num_tokens, d_out)
+            queries = queries.to(x.dtype)
 
-        if (self.is_quantized == False):
+        # 2. Key projections
+        if self.is_quantized == False:
+            keys = x @ self.W_key.T  # Shape: (b, num_tokens, num_kv_groups * head_dim)
+        elif (self.is_quantized == False) and (
+            self.calibrating == True
+        ):  # During calibration
+            self.observe_activation(x)
             keys = x @ self.W_key.T  # Shape: (b, num_tokens, num_kv_groups * head_dim)
         else:
-            # Dequantize weights on-the-fly
-            W_key_deq = de_quantize_matrix_symmetric_int8(
-                self.W_key_q, self.W_key_scale, out_dtype=x.dtype
-            )
-            keys = x @ W_key_deq.T  # Shape: (b, num_tokens, num_kv_groups * head_dim)
-        
-        if (self.is_quantized == False):
-            values = x @ self.W_value.T  # Shape: (b, num_tokens, num_kv_groups * head_dim)
+            if x.dtype != torch.int8:
+                X_q = torch.clamp(torch.round(x / self.x_scale), -128, 127).to(
+                    torch.int8
+                )
+            else:
+                X_q = x
+            keys_quant = dummy_int8_matmul(X_q, self.W_key_q.T, out_dtype=torch.int32)
+            keys = (
+                keys_quant.to(x.dtype) * self.x_scale * self.W_key_scale
+            )  # Shape: (b, num_tokens, num_kv_groups * head_dim)
+            keys = keys.to(x.dtype)
+
+        # 3. Value projections
+        if self.is_quantized == False:
+            values = (
+                x @ self.W_value.T
+            )  # Shape: (b, num_tokens, num_kv_groups * head_dim)
+        elif (self.is_quantized == False) and (
+            self.calibrating == True
+        ):  # During calibration
+            self.observe_activation(x)
+            values = (
+                x @ self.W_value.T
+            )  # Shape: (b, num_tokens, num_kv_groups * head_dim)
         else:
-            # Dequantize weights on-the-fly
-            W_value_deq = de_quantize_matrix_symmetric_int8(
-                self.W_value_q, self.W_value_scale, out_dtype=x.dtype
+            if x.dtype != torch.int8:
+                X_q = torch.clamp(torch.round(x / self.x_scale), -128, 127).to(
+                    torch.int8
+                )
+            else:
+                X_q = x
+            values_quant = dummy_int8_matmul(
+                X_q, self.W_value_q.T, out_dtype=torch.int32
             )
-            values = x @ W_value_deq.T  # Shape: (b, num_tokens, num_kv_groups * head_dim)
+            values = (
+                values_quant.to(x.dtype) * self.x_scale * self.W_value_scale
+            )  # Shape: (b, num_tokens, num_kv_groups * head_dim)
+            values = values.to(x.dtype)
 
         # Reshape queries, keys, and values
         queries = queries.view(b, num_tokens, self.num_heads, self.head_dim)
@@ -305,13 +364,9 @@ class GroupedQueryAttention(nn.Module):
         keys = keys.repeat_interleave(self.group_size, dim=1)  # Shape: (b, num_heads, num_tokens, head_dim)
         values = values.repeat_interleave(self.group_size, dim=1)  # Shape: (b, num_heads, num_tokens, head_dim)
 
-        # Compute scaled dot-product attention (aka self-attention) with a causal mask
-        # Shape: (b, num_heads, num_tokens, num_tokens)
-        attn_scores = queries @ keys.transpose(2, 3)  # Dot product for each head
-
-        # Use the mask to fill attention scores
+        # Scaled dot-product attention with a causal mask
+        attn_scores = queries @ keys.transpose(2, 3)  # Shape: (b, num_heads, num_tokens, num_tokens)
         attn_scores = attn_scores.masked_fill(mask[:num_tokens, :num_tokens], -torch.inf)
-
         attn_weights = torch.softmax(attn_scores / keys.shape[-1] ** 0.5, dim=-1)
         assert keys.shape[-1] == self.head_dim
 
@@ -320,15 +375,21 @@ class GroupedQueryAttention(nn.Module):
 
         # Combine heads, where self.d_out = self.num_heads * self.head_dim
         context_vec = context_vec.reshape(b, num_tokens, self.d_out)
-        
-        if (self.is_quantized == False):
+
+        if (self.is_quantized == False) and (self.calibrating == False):
+            context_vec = context_vec @ self.out_proj.T
+        elif (self.is_quantized == False) and (self.calibrating == True):  # Calibration
+            self.observe_output_activation(context_vec)
             context_vec = context_vec @ self.out_proj.T
         else:
-            # Dequantize weights on-the-fly
-            out_proj_deq = de_quantize_matrix_symmetric_int8(
-                self.out_proj_q, self.out_proj_scale, out_dtype=x.dtype
-            )
-            context_vec = context_vec @ out_proj_deq.T
+            if context_vec.dtype != torch.int8:
+                context_vec_q = torch.clamp(torch.round(context_vec / self.x_o_scale), -128, 127).to(torch.int8)
+            else:
+                context_vec_q = context_vec
+                
+            context_quant = dummy_int8_matmul(context_vec_q, self.out_proj_q.T, out_dtype=torch.int32)
+            context_vec = (context_quant.to(x.dtype) * self.x_o_scale * self.out_proj_scale)  # Shape: (b, num_tokens, d_out)
+            context_vec = context_vec.to(x.dtype)
 
         return context_vec
 
