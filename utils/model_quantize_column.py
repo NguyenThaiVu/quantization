@@ -134,33 +134,34 @@ class FeedForward(nn.Module):
         return self.fc3(x)
 
 
-def quantize_matrix_symmetric_int8(mat:torch.Tensor):
+@torch.no_grad()
+def quantized_column_matrix_int_symmetric(mat:torch.Tensor):
     """
-    Symmetric quantization to int8.
-    mat: input float matrix (e.g., torch.float32 or torch.bfloat16)
+    Symmetric quantization to int8 on a per-column basis.
+    mat: input float tensor (e.g., torch.float32 or torch.bfloat16)
     """
-    max_val = torch.max(torch.abs(mat))
-    
     qmin = -128
     qmax = 127
-    scale = max_val / qmax
     
-    q_mat = torch.clamp(torch.round(mat / scale), qmin, qmax).to(torch.int8)
+    max_vals, _ = torch.max(torch.abs(mat), dim=0, keepdim=True)  # shape (1, M)
+    scales = (max_vals / qmax).squeeze(0)  # shape (M,)
     
-    scale = scale.clone().detach().to(torch.float32)
-    return q_mat, scale
+    q_mat = torch.clamp(torch.round(mat / scales.unsqueeze(0)), qmin, qmax).to(torch.int8)  # shape (N, M)
+    
+    scales = scales.clone().detach().to(torch.float32)
+    return q_mat, scales
 
-def de_quantize_matrix_symmetric_int8(q_mat:torch.Tensor, scale:torch.Tensor, out_dtype=torch.float16):
+@torch.no_grad()
+def de_quantized_column_matrix_int8_symmetric(q_mat:torch.Tensor, scale:torch.Tensor, out_dtype=torch.bfloat16):
     """
-    Dequantize int8 tensor to float.
-    q_mat: input int8 tensor
-    scale: scale factor (single value)
+    Dequantize int8 matrix to float on a per-column basis.
+    q_mat: input int8 tensor (shape (N, M))
+    scales: scale factors for each column (shape (M,))
     """
     output = q_mat.to(torch.float32) 
-    output = output * scale
+    output = output * scale[None, :]
     output = output.to(out_dtype)
     return output
-
 
 class GroupedQueryAttention(nn.Module):
     def __init__(self, d_in, d_out, num_heads, num_kv_groups, dtype=None):
@@ -183,10 +184,10 @@ class GroupedQueryAttention(nn.Module):
         self.out_proj = nn.Parameter(torch.empty((d_out, d_out), dtype=dtype))
         
         # Quantization parameters
-        self.register_buffer('W_query_scale', torch.ones(1, dtype=torch.float32), persistent=False)
-        self.register_buffer('W_key_scale', torch.ones(1, dtype=torch.float32), persistent=False)
-        self.register_buffer('W_value_scale', torch.ones(1, dtype=torch.float32), persistent=False)
-        self.register_buffer('out_proj_scale', torch.ones(1, dtype=torch.float32), persistent=False)
+        self.register_buffer('W_query_scale', torch.ones(d_in, dtype=torch.float32), persistent=False)
+        self.register_buffer('W_key_scale', torch.ones(d_in, dtype=torch.float32), persistent=False)
+        self.register_buffer('W_value_scale', torch.ones(d_in, dtype=torch.float32), persistent=False)
+        self.register_buffer('out_proj_scale', torch.ones(d_out, dtype=torch.float32), persistent=False)
         
         self.register_buffer('W_query_q', torch.empty_like(self.W_query, dtype=torch.int8), persistent=False)
         self.register_buffer('W_key_q', torch.empty_like(self.W_key, dtype=torch.int8), persistent=False)
@@ -198,12 +199,12 @@ class GroupedQueryAttention(nn.Module):
     @torch.no_grad()
     def quantize_weights(self):
         # Quantize W_query
-        W_query_q, W_query_scale = quantize_matrix_symmetric_int8(self.W_query)
+        W_query_q, W_query_scale = quantized_column_matrix_int_symmetric(self.W_query)
         self.W_query_q.copy_(W_query_q)
         self.W_query_scale.copy_(W_query_scale)
         
         # Compare MSE before deleting original weights
-        W_query_deq = de_quantize_matrix_symmetric_int8(
+        W_query_deq = de_quantized_column_matrix_int8_symmetric(
             self.W_query_q, self.W_query_scale, out_dtype=self.W_query.dtype
         )
         mse_W_query = torch.mean((self.W_query - W_query_deq) ** 2).item()
@@ -211,11 +212,11 @@ class GroupedQueryAttention(nn.Module):
         ################################################################################
         
         # Quantize W_key
-        W_key_q, W_key_scale = quantize_matrix_symmetric_int8(self.W_key)
+        W_key_q, W_key_scale = quantized_column_matrix_int_symmetric(self.W_key)
         self.W_key_q.copy_(W_key_q)
         self.W_key_scale.copy_(W_key_scale)
         
-        W_key_deq = de_quantize_matrix_symmetric_int8(
+        W_key_deq = de_quantized_column_matrix_int8_symmetric(
             self.W_key_q, self.W_key_scale, out_dtype=self.W_key.dtype
         )
         mse_W_key = torch.mean((self.W_key - W_key_deq) ** 2).item()
@@ -223,11 +224,11 @@ class GroupedQueryAttention(nn.Module):
         ################################################################################
         
         # Quantize W_value
-        W_value_q, W_value_scale = quantize_matrix_symmetric_int8(self.W_value)
+        W_value_q, W_value_scale = quantized_column_matrix_int_symmetric(self.W_value)
         self.W_value_q.copy_(W_value_q)
         self.W_value_scale.copy_(W_value_scale)
         
-        W_value_deq = de_quantize_matrix_symmetric_int8(
+        W_value_deq = de_quantized_column_matrix_int8_symmetric(
             self.W_value_q, self.W_value_scale, out_dtype=self.W_value.dtype
         )
         mse_W_value = torch.mean((self.W_value - W_value_deq) ** 2).item()
@@ -235,18 +236,18 @@ class GroupedQueryAttention(nn.Module):
         ################################################################################
         
         # Quantize out_proj
-        out_proj_q, out_proj_scale = quantize_matrix_symmetric_int8(self.out_proj)
+        out_proj_q, out_proj_scale = quantized_column_matrix_int_symmetric(self.out_proj)
         self.out_proj_q.copy_(out_proj_q)
         self.out_proj_scale.copy_(out_proj_scale)
         
-        out_proj_deq = de_quantize_matrix_symmetric_int8(
+        out_proj_deq = de_quantized_column_matrix_int8_symmetric(
             self.out_proj_q, self.out_proj_scale, out_dtype=self.out_proj.dtype
         )
         mse_out_proj = torch.mean((self.out_proj - out_proj_deq) ** 2).item()
         print(f"[INFO] MSE for out_proj after quantization-dequantization: {mse_out_proj:.6f}")
         ################################################################################
         
-        # Free up memory 
+        # Free up memory  # TODO
         del self.W_query
         del self.W_key
         del self.W_value
@@ -264,7 +265,7 @@ class GroupedQueryAttention(nn.Module):
             queries = x @ self.W_query.T  # Shape: (b, num_tokens, d_out)
         else:
             # Dequantize weights on-the-fly
-            W_query_deq = de_quantize_matrix_symmetric_int8(
+            W_query_deq = de_quantized_column_matrix_int8_symmetric(
                 self.W_query_q, self.W_query_scale, out_dtype=x.dtype
             )
             queries = x @ W_query_deq.T  # Shape: (b, num_tokens, d_out)
@@ -273,7 +274,7 @@ class GroupedQueryAttention(nn.Module):
             keys = x @ self.W_key.T  # Shape: (b, num_tokens, num_kv_groups * head_dim)
         else:
             # Dequantize weights on-the-fly
-            W_key_deq = de_quantize_matrix_symmetric_int8(
+            W_key_deq = de_quantized_column_matrix_int8_symmetric(
                 self.W_key_q, self.W_key_scale, out_dtype=x.dtype
             )
             keys = x @ W_key_deq.T  # Shape: (b, num_tokens, num_kv_groups * head_dim)
@@ -282,7 +283,7 @@ class GroupedQueryAttention(nn.Module):
             values = x @ self.W_value.T  # Shape: (b, num_tokens, num_kv_groups * head_dim)
         else:
             # Dequantize weights on-the-fly
-            W_value_deq = de_quantize_matrix_symmetric_int8(
+            W_value_deq = de_quantized_column_matrix_int8_symmetric(
                 self.W_value_q, self.W_value_scale, out_dtype=x.dtype
             )
             values = x @ W_value_deq.T  # Shape: (b, num_tokens, num_kv_groups * head_dim)
@@ -325,7 +326,7 @@ class GroupedQueryAttention(nn.Module):
             context_vec = context_vec @ self.out_proj.T
         else:
             # Dequantize weights on-the-fly
-            out_proj_deq = de_quantize_matrix_symmetric_int8(
+            out_proj_deq = de_quantized_column_matrix_int8_symmetric(
                 self.out_proj_q, self.out_proj_scale, out_dtype=x.dtype
             )
             context_vec = context_vec @ out_proj_deq.T
