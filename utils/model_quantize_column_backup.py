@@ -226,12 +226,22 @@ class GroupedQueryAttention(nn.Module):
         self.register_buffer("out_proj_q", torch.empty_like(self.out_proj, dtype=torch.int8),persistent=False)
 
         # Calibration flag
+        self.register_buffer("x_min", torch.tensor(0.0, dtype=torch.float32), persistent=False)
+        self.register_buffer("x_max", torch.tensor(0.0, dtype=torch.float32), persistent=False)
+        self.register_buffer("x_scale", torch.tensor(1.0, dtype=torch.float32), persistent=False)
         self.register_buffer("x_o_min", torch.tensor(0.0, dtype=torch.float32), persistent=False)  # output of scaled dot-product
         self.register_buffer("x_o_max", torch.tensor(0.0, dtype=torch.float32), persistent=False)  # output of scaled dot-product
         self.register_buffer("x_o_scale", torch.tensor(1.0, dtype=torch.float32), persistent=False)  # output of scaled dot-product
         self.calibrating = True
 
         self.is_quantized = False
+
+    @torch.no_grad()
+    def observe_activation(self, x):
+        min_val = x.min()
+        max_val = x.max()
+        self.x_min = min(self.x_min, min_val)
+        self.x_max = max(self.x_max, max_val)
         
     @torch.no_grad()
     def observe_output_activation(self, x_o):
@@ -266,61 +276,69 @@ class GroupedQueryAttention(nn.Module):
 
         self.is_quantized = True
         print("[INFO] Quantized weights to int8. Deleted original weights to save memory.")
+
+        # Compute activation quantization parameters per row (for input x)
+        x_max = max(abs(self.x_min), abs(self.x_max))
+        x_scale = x_max / 127.0
+        self.x_scale.copy_(x_scale)
+        print(f"[INFO] Activation quantization scale set to {x_scale.item():.6f}")
         
         # Compute output activation quantization parameters
         x_o_max = max(abs(self.x_o_min), abs(self.x_o_max))
         x_o_scale = x_o_max / 127.0
         self.x_o_scale.copy_(x_o_scale)
         print(f"[INFO] Output activation quantization scale set to {x_o_scale.item():.6f}")
-
-    @torch.no_grad()
-    def quantize_row_matrix_int8_symmetric_batched(self, mat: torch.Tensor):
-        """
-        Symmetric per-row quantization for batched 3D tensor.
-        mat: [B, N, D]  (float tensor)
         
-        Returns:
-            q_mat:   [B, N, D] int8
-            scales:  [B, N]    float32  (scale per row within each batch)
-        """
-        qmin, qmax = -128, 127
-
-        # Compute max abs per row (per batch) - Result shape: [B, N, 1]
-        max_vals, _ = torch.max(torch.abs(mat), dim=2, keepdim=True)
-
-        # Compute scales per row
-        scales = (max_vals / qmax).clamp(min=1e-12)  # avoid div-by-zero, shape [B, N, 1]
-
-        # Quantize
-        q_mat = torch.clamp(torch.round(mat / scales), qmin, qmax).to(torch.int8)
-
-        # Return float scales of shape [B, N]
-        scales = scales.squeeze(2).to(torch.float32)
-        return q_mat, scales        
 
     def forward(self, x, mask, cos, sin):
         b, num_tokens, d_in = x.shape
 
         # 1. Query projection
-        if self.is_quantized == False:
+        if (self.is_quantized == False) and (self.calibrating == False):
             queries = x @ self.W_query  # Shape: (b, num_tokens, d_out)
-            keys = x @ self.W_key  # Shape: (b, num_tokens, num_kv_groups * head_dim)
-            values = (x @ self.W_value)  # Shape: (b, num_tokens, num_kv_groups * head_dim)
-            
+        elif (self.is_quantized == False) and (self.calibrating == True):  # Calibration
+            self.observe_activation(x)
+            queries = x @ self.W_query  # Shape: (b, num_tokens, d_out)
         else:
             # Quantize input
-            X_q, x_scale = self.quantize_row_matrix_int8_symmetric_batched(x)
-
+            if x.dtype != torch.int8:
+                X_q = torch.clamp(torch.round(x / self.x_scale), -128, 127).to(torch.int8)
+            else:
+                X_q = x
             queries_quant = dummy_int8_matmul(X_q, self.W_query_q, out_dtype=torch.int32)
-            queries = queries_quant * self.W_query_scale[None, :] * x_scale.unsqueeze(-1)
+            queries = queries_quant * self.W_query_scale[None, :] * self.x_scale
             queries = queries.to(x.dtype)
-            
+
+        # 2. Key projections
+        if self.is_quantized == False:
+            keys = x @ self.W_key  # Shape: (b, num_tokens, num_kv_groups * head_dim)
+        elif (self.is_quantized == False) and (self.calibrating == True):  # Calibration
+            self.observe_activation(x)
+            keys = x @ self.W_key  # Shape: (b, num_tokens, num_kv_groups * head_dim)
+        else:
+            if x.dtype != torch.int8:
+                X_q = torch.clamp(torch.round(x / self.x_scale), -128, 127).to(torch.int8)
+            else:
+                X_q = x
             keys_quant = dummy_int8_matmul(X_q, self.W_key_q, out_dtype=torch.int32)
-            keys = keys_quant * self.W_key_scale[None, :] * x_scale.unsqueeze(-1)
+            keys = keys_quant * self.W_key_scale[None, :] * self.x_scale
             keys = keys.to(x.dtype)
-            
+
+        # 3. Value projections
+        if self.is_quantized == False:
+            values = (x @ self.W_value)  # Shape: (b, num_tokens, num_kv_groups * head_dim)
+        elif (self.is_quantized == False) and (self.calibrating == True):  # Calibration
+            self.observe_activation(x)
+            values = (
+                x @ self.W_value
+            )  # Shape: (b, num_tokens, num_kv_groups * head_dim)
+        else:
+            if x.dtype != torch.int8:
+                X_q = torch.clamp(torch.round(x / self.x_scale), -128, 127).to(torch.int8)
+            else:
+                X_q = x
             values_quant = dummy_int8_matmul(X_q, self.W_value_q, out_dtype=torch.int32)
-            values = values_quant * self.W_value_scale[None, :] * x_scale.unsqueeze(-1)
+            values = values_quant * self.W_value_scale[None, :] * self.x_scale
             values = values.to(x.dtype)
 
         # Reshape queries, keys, and values
