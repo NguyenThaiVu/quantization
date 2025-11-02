@@ -309,13 +309,17 @@ class GroupedQueryAttention(nn.Module):
         else:
             # Quantize input
             X_q, x_scale = self.quantize_row_matrix_int8_symmetric_batched(x)
+            
+            # Compress x_scale to single scale x_scale 
+            global_x_scale = x_scale.mean(dim=1)  # Shape: (b,)
+            global_x_scale = global_x_scale.unsqueeze(1).unsqueeze(2)  # Shape: (b, 1) -> (b, 1, 1)
 
             queries_quant = dummy_int8_matmul(X_q, self.W_query_q, out_dtype=torch.int32)
-            queries = x_scale.unsqueeze(-1) * queries_quant * self.W_query_scale[None, :]
+            queries = global_x_scale * queries_quant * self.W_query_scale[None, :]
             queries = queries.to(x.dtype)
             
             keys_quant = dummy_int8_matmul(X_q, self.W_key_q, out_dtype=torch.int32)
-            keys = x_scale.unsqueeze(-1) * keys_quant * self.W_key_scale[None, :]
+            keys = global_x_scale * keys_quant * self.W_key_scale[None, :]
             keys = keys.to(x.dtype)
             
             values_quant = dummy_int8_matmul(X_q, self.W_value_q, out_dtype=torch.int32)
