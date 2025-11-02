@@ -193,6 +193,24 @@ def dummy_int8_matmul(A_int8: torch.Tensor, B_int: torch.Tensor, out_dtype=torch
     return result_float.to(out_dtype)
 
 
+def quantize_int8_symmetric_multiple_dim(x: torch.Tensor, dim):
+    """
+    Symmetric int8 quantization along given dimension(s).
+    x: input tensor (float)
+    dim: int or tuple[int] — dimension(s) to reduce over
+    """
+    qmin, qmax = -128, 127
+
+    # Compute scale along specified dimension(s)
+    max_vals = torch.amax(torch.abs(x), dim=dim, keepdim=True)
+    scales = max_vals / qmax
+    scales = torch.where(scales == 0, torch.ones_like(scales), scales)
+
+    # Quantize
+    x_q = torch.clamp(torch.round(x / scales), qmin, qmax).to(torch.int8)
+    return x_q, scales
+
+
 class GroupedQueryAttention(nn.Module):
     def __init__(self, d_in, d_out, num_heads, num_kv_groups, dtype=None):
         super().__init__()
@@ -309,17 +327,13 @@ class GroupedQueryAttention(nn.Module):
         else:
             # Quantize input
             X_q, x_scale = self.quantize_row_matrix_int8_symmetric_batched(x)
-            
-            # Compress x_scale to single scale x_scale 
-            global_x_scale = x_scale.mean(dim=1)  # Shape: (b,)
-            global_x_scale = global_x_scale.unsqueeze(1).unsqueeze(2)  # Shape: (b, 1) -> (b, 1, 1)
 
             queries_quant = dummy_int8_matmul(X_q, self.W_query_q, out_dtype=torch.int32)
-            queries = global_x_scale * queries_quant * self.W_query_scale[None, :]
+            queries = x_scale.unsqueeze(-1) * queries_quant * self.W_query_scale[None, :]
             queries = queries.to(x.dtype)
             
             keys_quant = dummy_int8_matmul(X_q, self.W_key_q, out_dtype=torch.int32)
-            keys = global_x_scale * keys_quant * self.W_key_scale[None, :]
+            keys = x_scale.unsqueeze(-1) * keys_quant * self.W_key_scale[None, :]
             keys = keys.to(x.dtype)
             
             values_quant = dummy_int8_matmul(X_q, self.W_value_q, out_dtype=torch.int32)
@@ -345,7 +359,22 @@ class GroupedQueryAttention(nn.Module):
         values = values.repeat_interleave(self.group_size, dim=1)  # Shape: (b, num_heads, num_tokens, head_dim)
 
         # Scaled dot-product attention with a causal mask
-        attn_scores = queries @ keys.transpose(2, 3)  # Shape: (b, num_heads, num_tokens, num_tokens)
+        if self.is_quantized == False:
+            attn_scores = queries @ keys.transpose(2, 3)  # Shape: (b, num_heads, num_tokens, num_tokens)
+        else:
+            queries_q, queries_scale = quantize_int8_symmetric_multiple_dim(queries, dim=-1)
+            keys_q, keys_scale = quantize_int8_symmetric_multiple_dim(keys, dim=-1)
+            
+            global_scale = queries_scale * keys_scale.transpose(2, 3)
+            
+            attn_scores_quant = dummy_int8_matmul(queries_q, keys_q.transpose(2, 3), out_dtype=torch.int32)
+            attn_scores = attn_scores_quant.to(torch.float32)
+            attn_scores = attn_scores * global_scale
+            attn_scores = attn_scores.to(x.dtype)
+            
+            
+        
+        
         attn_scores = attn_scores.masked_fill(mask[:num_tokens, :num_tokens], -torch.inf)
         attn_weights = torch.softmax(attn_scores / keys.shape[-1] ** 0.5, dim=-1)
         assert keys.shape[-1] == self.head_dim
