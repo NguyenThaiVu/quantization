@@ -7,8 +7,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .transformer import Transformer
-# from .transformer_quantization import Transformer
+# from .transformer import Transformer
+from .transformer_quantization import Transformer
 from .utils import load_pretrained_weights, as_tuple
 from .configs import PRETRAINED_MODELS
 
@@ -25,7 +25,7 @@ class PositionalEmbedding1D(nn.Module):
         return x + self.pos_embedding
 
 
-class ViT(nn.Module):
+class ViT_Quantized(nn.Module):
     """
     Args:
         name (str): Model name, e.g. 'B_16'
